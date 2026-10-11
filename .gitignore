@@ -1,0 +1,16 @@
+**/bin/
+**/obj/
+native/target/
+dist/
+artifacts/
+*.reference
+*.log
+*.env
+.env*
+config.json
+accounts.enc
+vault.key
+*.tmp
+backups/
+private/
+.buddyhub/
