@@ -56,6 +56,7 @@ fn fixture() -> Fixture {
             .build()
             .unwrap(),
         auth: Mutex::new(HashMap::new()),
+        request_ids: Mutex::new(HashMap::new()),
         checkin: Mutex::new(()),
         services: Mutex::new(()),
         proxy: Mutex::new(None),
@@ -118,6 +119,219 @@ fn chat(app: &Arc<App>, base: &str, model: &str, stream: bool) -> reqwest::block
 }
 fn ok_stream(req: Request) {
     let _=req.respond(Response::from_string("data: {\"id\":\"chat-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"OK\",\"reasoning_content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":2}}\n\ndata: [DONE]\n\n").with_header(Header::from_bytes("Content-Type","text/event-stream").unwrap()));
+}
+
+#[test]
+fn native_large_image_history_survives_fixed_and_chunked_requests() {
+    let f = fixture();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let saved = seen.clone();
+    let image_size = 17 * 1024 * 1024;
+    let m = mock(move |mut req| {
+        let payload = read_json_body(&mut req, CHAT_BODY_LIMIT).unwrap_or_else(|e| panic!("{}", e.code));
+        assert_eq!(header(&req, "X-User-Id"), "ai1");
+        let messages = payload["messages"].as_array().unwrap();
+        let url = messages[2]["content"][0]["image_url"]["url"].as_str().unwrap();
+        assert_eq!(url.len(), image_size + "data:image/png;base64,".len());
+        assert!(url.ends_with("AAAA"));
+        assert_eq!(messages[4]["content"], "image-check-result-END");
+        saved.fetch_add(1, Ordering::SeqCst);
+        ok_stream(req);
+    });
+    bind(&f.app, &m);
+    let url = proxy_url(&f.app);
+    let payload = json!({"model":"deepseek-v4.1-flash-ai","messages":[
+        {"role":"system","content":"Inspect the provided image."},
+        {"role":"user","content":"Continue inspecting the image history."},
+        {"role":"user","content":[{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{}", "A".repeat(image_size))}}]},
+        {"role":"assistant","tool_calls":[{"id":"image1","type":"function","function":{"name":"inspect_image","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"image1","content":"image-check-result-END"}]});
+    let bytes = serde_json::to_vec(&payload).unwrap();
+    for chunked in [false, true] {
+        let request = f.app.http.post(format!("{url}/v1/chat/completions"))
+            .bearer_auth("test-key").header("Content-Type", "application/json");
+        let request = if chunked {
+            request.body(reqwest::blocking::Body::new(std::io::Cursor::new(bytes.clone())))
+        } else { request.body(bytes.clone()) };
+        let r = request.send().unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(r.json::<V>().unwrap()["choices"][0]["message"]["content"], "OK");
+    }
+    assert_eq!(seen.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn native_body_limits_distinguish_size_encoding_and_json_errors() {
+    let m = mock(move |mut req| {
+        match read_json_body(&mut req, 128) {
+            Ok(value) => respond(req, 200, value),
+            Err(e) => respond(req, e.status, json!({"error":{"code":e.code,"message":e.message}})),
+        }
+    });
+    let client = Client::builder().no_proxy().timeout(Wait::from_secs(5)).build().unwrap();
+    for chunked in [false, true] {
+        for size in [128, 129] {
+            let bytes = format!("{{\"text\":\"{}\"}}", "x".repeat(size - 11)).into_bytes();
+            assert_eq!(bytes.len(), size);
+            let r = client.post(&m.url);
+            let r = if chunked { r.body(reqwest::blocking::Body::new(std::io::Cursor::new(bytes))) }
+                else { r.body(bytes) }.send().unwrap();
+            if size == 128 { assert_eq!(r.status().as_u16(), 200); r.text().unwrap(); }
+            else { assert_eq!(r.status().as_u16(), 413); assert_eq!(r.json::<V>().unwrap()["error"]["code"], "request_too_large"); }
+        }
+    }
+    let r = client.post(&m.url).body("{\"private-secret\":.").send().unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+    let error = r.json::<V>().unwrap();
+    assert_eq!(error["error"]["code"], "invalid_json");
+    assert!(s(&error["error"], "message").contains("第 1 行"));
+    assert!(!error.to_string().contains("private-secret"));
+    let r = client.post(&m.url).header("Content-Encoding", "gzip").body("compressed").send().unwrap();
+    assert_eq!(r.status().as_u16(), 415);
+    assert_eq!(r.json::<V>().unwrap()["error"]["code"], "unsupported_content_encoding");
+}
+
+#[test]
+fn native_nonobject_request_never_reaches_account_pool() {
+    let f = fixture();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saved = calls.clone();
+    let m = mock(move |req| { saved.fetch_add(1, Ordering::SeqCst); ok_stream(req); });
+    bind(&f.app, &m);
+    let url = proxy_url(&f.app);
+    let r = f.app.http.post(format!("{url}/v1/chat/completions")).bearer_auth("test-key")
+        .json(&json!([1, 2])).send().unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+    assert_eq!(r.json::<V>().unwrap()["error"]["code"], "invalid_request");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn native_conversation_ids_follow_sessions_turns_and_accounts() {
+    let f = fixture();
+    let observed = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let saved = observed.clone();
+    let m = mock(move |req| {
+        saved.lock().unwrap().push(["X-Conversation-ID", "X-Conversation-Request-ID",
+            "X-Conversation-Message-ID", "X-Request-ID"].iter().map(|h| header(&req, h)).collect());
+        ok_stream(req);
+    });
+    bind(&f.app, &m);
+    let url = proxy_url(&f.app);
+    let first = json!([{"role":"user","content":"start"}]);
+    let tools = json!([{"role":"user","content":"start"},
+        {"role":"assistant","tool_calls":[{"id":"t","type":"function","function":{"name":"ping","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"t","content":"OK"}]);
+    let mut next = tools.clone();
+    next.as_array_mut().unwrap().push(json!({"role":"user","content":"continue"}));
+    for (hint, messages, site) in [("chat-a", first.clone(), "ai"), ("chat-a", tools, "ai"),
+        ("chat-a", next, "ai"), ("chat-b", first.clone(), "ai"), ("chat-a", first, "cn")] {
+        let r = f.app.http.post(format!("{url}/v1/chat/completions")).bearer_auth("test-key")
+            .header("X-BuddyHub-Session-ID", hint)
+            .json(&json!({"model":format!("deepseek-v4.1-flash-{site}"),"messages":messages})).send().unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        r.text().unwrap();
+    }
+    let calls = observed.lock().unwrap();
+    assert_eq!(calls[0][0], calls[1][0]);
+    assert_eq!(calls[0][0], calls[2][0]);
+    assert_eq!(calls[0][1], calls[1][1]);
+    assert_ne!(calls[0][1], calls[2][1]);
+    assert_ne!(calls[0][2], calls[1][2]);
+    assert_ne!(calls[0][0], calls[3][0]);
+    assert_ne!(calls[0][0], calls[4][0]);
+    for ids in calls.iter() {
+        assert_eq!(ids[0].len(), 36);
+        assert_eq!(ids[0].as_bytes()[14], b'7');
+        assert_eq!(ids[1].len(), 32);
+        assert_eq!(ids[1].as_bytes()[12], b'7');
+        assert_eq!(ids[2], ids[3]);
+    }
+}
+
+#[test]
+fn native_channel_errors_preserve_safe_details_without_rotating_or_cooling() {
+    for sse in [false, true] {
+        let f = fixture();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let m = mock(move |req| {
+            c.fetch_add(1, Ordering::SeqCst);
+            let error = json!({"code":11128,"msg":"secret-echo",
+                "displayTips":{"zh":"credit 额度 private-value"},"data":{"accessToken":"private-token"}});
+            if sse {
+                let _ = req.respond(Response::from_string(format!("data: {error}\n\n")));
+            } else { respond(req, 400, error); }
+        });
+        bind(&f.app, &m);
+        let url = proxy_url(&f.app);
+        for stream in [false, true] {
+            let r = chat(&f.app, &url, "deepseek-v4.1-flash-ai", stream);
+            assert_eq!(r.status().as_u16(), 400);
+            let response = r.text().unwrap();
+            let data: V = serde_json::from_str(&response).unwrap();
+            assert_eq!(data["error"]["code"], 11128);
+            assert!(s(&data["error"], "message").contains("conversation id missing"));
+            for secret in ["secret-echo", "private-value", "private-token"] { assert!(!response.contains(secret)); }
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let a = f.app.account("ai1").unwrap();
+        assert_eq!(n(&a, "cooldownUntil"), 0.0);
+        assert!(!s(&a, "lastError").contains("secret"));
+    }
+}
+
+#[test]
+fn native_round_robin_retains_each_accounts_own_conversation() {
+    let f = fixture();
+    let observed = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let saved = observed.clone();
+    let m = mock(move |req| {
+        saved.lock().unwrap().push(["X-User-Id", "X-Conversation-ID", "X-Conversation-Request-ID"]
+            .iter().map(|h| header(&req, h)).collect());
+        ok_stream(req);
+    });
+    bind(&f.app, &m);
+    let url = proxy_url(&f.app);
+    for step in 0..3 {
+        let mut messages = vec![json!({"role":"user","content":"start"})];
+        if step > 0 {
+            messages.push(json!({"role":"assistant","tool_calls":[{"id":"t","type":"function","function":{"name":"ping","arguments":"{}"}}]}));
+            messages.push(json!({"role":"tool","tool_call_id":"t","content":"OK"}));
+        }
+        f.app.http.post(format!("{url}/v1/chat/completions")).bearer_auth("test-key")
+            .header("X-BuddyHub-Session-ID", "round-robin-chat")
+            .json(&json!({"model":"deepseek-v4.1-flash-cn","messages":messages}))
+            .send().unwrap().text().unwrap();
+        while f.app.state.lock().unwrap().inflight.values().any(|count| *count > 0) {
+            thread::sleep(Wait::from_millis(1));
+        }
+    }
+    let calls = observed.lock().unwrap();
+    assert_eq!(calls.iter().map(|ids| ids[0].as_str()).collect::<Vec<_>>(), vec!["cn1", "cn2", "cn1"]);
+    assert_ne!(calls[0][1], calls[1][1]);
+    assert_eq!(calls[0][1], calls[2][1]);
+    assert_eq!(calls[0][2], calls[2][2]);
+}
+
+#[test]
+fn native_unrecognized_and_oversized_errors_do_not_echo_upstream_bodies() {
+    for error in [json!({"code":12345,"msg":"private-secret"}).to_string(),
+        "<html>private-secret</html>".to_owned(),
+        json!({"code":11128,"msg":"private-secret".repeat(2000)}).to_string()] {
+        let f = fixture();
+        let m = mock(move |req| {
+            let _ = req.respond(Response::from_string(error.clone()).with_status_code(StatusCode(400)));
+        });
+        bind(&f.app, &m);
+        let url = proxy_url(&f.app);
+        let r = chat(&f.app, &url, "deepseek-v4.1-flash-ai", false);
+        assert_eq!(r.status().as_u16(), 400);
+        let response = r.text().unwrap();
+        assert!(!response.contains("private-secret"));
+        assert!(response.len() < 300);
+        assert_eq!(n(&f.app.account("ai1").unwrap(), "cooldownUntil"), 0.0);
+    }
 }
 
 #[test]

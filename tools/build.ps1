@@ -17,6 +17,13 @@ foreach($name in 'install.ps1','uninstall.ps1'){
 foreach($name in 'README.md','LICENSE','THIRD_PARTY_NOTICES.md','setup.cmd'){
     Copy-Item -LiteralPath (Join-Path $root $name) -Destination $package
 }
+$sourceCommit='unknown'
+if((Get-Command git -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath (Join-Path $root '.git'))){
+    $sourceCommit=(& git -C $root rev-parse HEAD | Out-String).Trim()
+    if($LASTEXITCODE -ne 0){throw 'Could not determine source commit'}
+}
+@{version=$Version;sourceCommit=$sourceCommit;builtAtUtc=[DateTime]::UtcNow.ToString('o')} |
+    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $package 'BUILD_INFO.json') -Encoding UTF8
 & (Join-Path $PSScriptRoot 'collect-licenses.ps1') -Destination (Join-Path $package 'licenses') -Target $NativeTarget
 $zip=$package+'.zip'
 Compress-Archive -LiteralPath $package -DestinationPath $zip

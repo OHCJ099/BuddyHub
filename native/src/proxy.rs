@@ -2,6 +2,69 @@ use super::*;
 use std::io::{BufRead, BufReader};
 const MODELS: &[&str] = &["deepseek-v4.1-flash"];
 const EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+struct RequestContext {
+    session: String,
+    turn: String,
+}
+impl RequestContext {
+    fn new(payload: &V, session_hint: &str) -> Self {
+        let messages = payload["messages"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        // Clients may supply an opaque session key. Otherwise retain the initial
+        // context through tool continuations, without storing prompts in the cache.
+        let initial = messages.iter().find(|m| s(m, "role") == "user");
+        let system = messages.iter().find(|m| s(m, "role") == "system");
+        let session = if session_hint.is_empty() {
+            hex(&Sha256::digest(serde_json::to_vec(&(system, initial)).unwrap()))
+        } else {
+            hex(&Sha256::digest(session_hint.as_bytes()))
+        };
+        let end = messages.iter().rposition(|m| s(m, "role") == "user")
+            .map(|i| i + 1).unwrap_or(messages.len());
+        let turn = hex(&Sha256::digest(serde_json::to_vec(&messages[..end]).unwrap()));
+        Self { session, turn }
+    }
+}
+fn uuid7() -> String {
+    let mut bytes = random(16);
+    bytes[..6].copy_from_slice(&now().to_be_bytes()[2..]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    hex(&bytes)
+}
+struct UpstreamFailure {
+    status: u16,
+    rotate: bool,
+    code: Option<i64>,
+    message: String,
+}
+impl UpstreamFailure {
+    fn classify(status: u16, value: &V) -> Self {
+        let code = value["code"].as_i64().or_else(|| value["error"]["code"].as_i64());
+        let msg = value["msg"].as_str().or_else(|| value["error"]["message"].as_str())
+            .or_else(|| value["message"].as_str()).or_else(|| value.as_str()).unwrap_or("");
+        let rotate = code != Some(11128) && (status == 429 || status >= 500
+            || [401, 403].contains(&status) || matches!(code, Some(401 | 403 | 429 | 10001)) || quota(msg));
+        // Unknown upstream messages can contain credentials or echoed prompts.
+        // Return reviewed summaries and numeric business codes only.
+        let message = if code == Some(11128) {
+            "上游会话信息缺失（conversation id missing）".to_owned()
+        } else { format!("上游拒绝请求，HTTP {status}") };
+        Self { status, rotate, code, message }
+    }
+    fn read(status: u16, response: reqwest::blocking::Response) -> Self {
+        let mut bytes = Vec::new();
+        let read = response.take(16 * 1024 + 1).read_to_end(&mut bytes);
+        let value = if read.is_ok() && bytes.len() <= 16 * 1024 {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| json!(String::from_utf8_lossy(&bytes)))
+        } else { V::Null };
+        Self::classify(status, &value)
+    }
+    fn json(&self) -> V {
+        let mut result = json!({"error":{"message":self.message,"type":"upstream_error"}});
+        if let Some(code) = self.code { result["error"]["code"] = json!(code); }
+        result
+    }
+}
 fn parse_model(id: &str, default: &str) -> Result<(String, String, Option<String>)> {
     let mut upstream = id.to_owned();
     let mut effort = None;
@@ -295,6 +358,21 @@ impl Read for StreamBody {
     }
 }
 impl App {
+    fn cached_request_id(&self, key: String) -> String {
+        let mut cache = self.request_ids.lock().unwrap();
+        if let Some((id, touched)) = cache.get_mut(&key) {
+            *touched = now();
+            return id.clone();
+        }
+        if cache.len() >= 2048 {
+            if let Some(oldest) = cache.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
+                cache.remove(&oldest);
+            }
+        }
+        let id = uuid7();
+        cache.insert(key, (id.clone(), now()));
+        id
+    }
     pub fn start_proxy(self: &Arc<Self>) -> Result<()> {
         let mut proxy = self.proxy.lock().unwrap();
         if proxy.is_some() {
@@ -373,15 +451,25 @@ impl App {
         &self,
         id: &str,
         payload: &V,
-    ) -> std::result::Result<reqwest::blocking::Response, (u16, bool)> {
-        let mut a = self.ensure(id).map_err(|_| (502, true))?;
-        let mut last = (502, true);
+        context: &RequestContext,
+    ) -> std::result::Result<reqwest::blocking::Response, UpstreamFailure> {
+        let mut a = self.ensure(id).map_err(|_| UpstreamFailure::classify(502, &V::Null))?;
+        let mut last = UpstreamFailure::classify(502, &V::Null);
+        // Account-scoped IDs keep independently rotated pools separate. One user
+        // turn retains its ID across tools; each model generation gets a new ID.
+        let session = self.cached_request_id(format!("session:{id}:{}", context.session));
+        let conversation = format!("{}-{}-{}-{}-{}", &session[..8], &session[8..12], &session[12..16], &session[16..20], &session[20..]);
+        let turn = self.cached_request_id(format!("turn:{id}:{}:{}", context.session, context.turn));
+        let message = uuid7();
         for base in self.bases(&s(&a, "site")) {
             for retry in 0..2 {
                 let r = self
                     .request(&a, &base, "/v2/chat/completions", payload)
                     .header("Accept", "text/event-stream")
-                    .header("X-Request-ID", hex(&random(16)))
+                    .header("X-Conversation-ID", &conversation)
+                    .header("X-Conversation-Request-ID", &turn)
+                    .header("X-Conversation-Message-ID", &message)
+                    .header("X-Request-ID", &message)
                     .header("X-Request-Trace-Id", hex(&random(16)))
                     .send();
                 match r {
@@ -393,28 +481,23 @@ impl App {
                                 .refresh_if_same(id, &s(&a, "accessToken"))
                                 .unwrap_or(false)
                             {
-                                a = self.account(id).map_err(|_| (502, true))?;
+                                a = self.account(id).map_err(|_| UpstreamFailure::classify(502, &V::Null))?;
                                 continue;
                             }
-                            last = (code, true);
+                            last = UpstreamFailure::classify(code, &V::Null);
                             break;
                         }
                         if code < 400 {
                             return Ok(r);
                         }
-                        let text = r.text().unwrap_or_default();
-                        let rotate = code == 429
-                            || code >= 500
-                            || [401, 403].contains(&code)
-                            || quota(&text);
-                        last = (code, rotate);
-                        if code == 400 && !rotate {
+                        last = UpstreamFailure::read(code, r);
+                        if !last.rotate {
                             return Err(last);
                         }
                         break;
                     }
                     Err(_) => {
-                        last = (502, true);
+                        last = UpstreamFailure::classify(502, &V::Null);
                         break;
                     }
                 }
@@ -460,10 +543,16 @@ fn handle(mut req: Request, app: Arc<App>) {
         respond(req, 404, json!({"error":{"message":"not found"}}));
         return;
     }
-    let body = match body(&mut req) {
+    let body = match read_json_body(&mut req, CHAT_BODY_LIMIT) {
         Ok(v) if v.is_object() => v,
-        _ => {
-            respond(req, 400, json!({"error":{"message":"JSON 格式错误"}}));
+        Ok(_) => {
+            app.log("请求拒绝", "HTTP 400 code=invalid_request 根节点必须是对象");
+            respond(req, 400, json!({"error":{"message":"请求 JSON 必须是对象","code":"invalid_request"}}));
+            return;
+        }
+        Err(e) => {
+            app.log("请求拒绝", &format!("HTTP {} code={} content_length={:?} limit={CHAT_BODY_LIMIT}", e.status, e.code, req.body_length()));
+            respond(req, e.status, json!({"error":{"message":e.message,"code":e.code,"type":"invalid_request_error"}}));
             return;
         }
     };
@@ -483,26 +572,32 @@ fn handle(mut req: Request, app: Arc<App>) {
             return;
         }
     };
-    let mut payload = prepare(body.clone());
+    let stream = b(&body, "stream");
+    let explicit_reasoning = !body["reasoning_effort"].is_null() || !body["reasoning"].is_null();
+    // Move the message tree so image-heavy histories are not duplicated in RAM.
+    let mut payload = prepare(body);
     payload["model"] = json!(upstream);
     if let Some(e) = effort {
         // Legacy aliases supply a default; explicit Hermes settings take precedence.
-        if body["reasoning_effort"].is_null() && body["reasoning"].is_null() {
+        if !explicit_reasoning {
             payload["reasoning_effort"] = json!(e);
         }
     }
     let mut excluded = Vec::new();
     let mut last = 503;
+    let context = RequestContext::new(&payload, &header(&req, "X-BuddyHub-Session-ID"));
     while let Some(a) = app.pick(&site, &excluded) {
         let id = s(&a, "id");
         excluded.push(id.clone());
-        let up = match app.upstream(&id, &payload) {
+        let up = match app.upstream(&id, &payload, &context) {
             Ok(r) => r,
-            Err((code, rotate)) => {
+            Err(error) => {
+                let code = error.status;
+                let rotate = error.rotate;
                 app.finish(
                     &id,
                     false,
-                    &format!("上游 HTTP {code}"),
+                    &error.message,
                     if rotate { 60000 } else { 0 },
                 );
                 last = code;
@@ -513,11 +608,8 @@ fn handle(mut req: Request, app: Arc<App>) {
                     );
                     continue;
                 }
-                respond(
-                    req,
-                    code,
-                    json!({"error":{"message":format!("上游拒绝请求，HTTP {code}"),"type":"upstream_error"}}),
-                );
+                app.log("上游拒绝", &format!("{site} HTTP {code} code={:?}", error.code));
+                respond(req, code, error.json());
                 return;
             }
         };
@@ -531,10 +623,9 @@ fn handle(mut req: Request, app: Arc<App>) {
             match frames.next() {
                 Ok(Some(raw)) => {
                     if business(&raw) {
-                        if !quota(&raw.to_string())
-                            && ![401.0, 403.0, 429.0, 10001.0].contains(&n(&raw, "code"))
-                        {
-                            nonretry = Some("上游业务错误".to_owned());
+                        let error = UpstreamFailure::classify(400, &raw);
+                        if !error.rotate {
+                            nonretry = Some(error);
                         }
                         break;
                     }
@@ -547,19 +638,17 @@ fn handle(mut req: Request, app: Arc<App>) {
             }
         }
         let Some(first) = first else {
-            app.finish(&id, false, "额度/连接异常，暂时冷却", 60000);
-            last = 502;
             if let Some(e) = nonretry {
-                respond(
-                    req,
-                    502,
-                    json!({"error":{"message":e,"type":"upstream_error"}}),
-                );
+                app.finish(&id, false, &e.message, 0);
+                app.log("上游拒绝", &format!("{site} SSE code={:?}", e.code));
+                respond(req, e.status, e.json());
                 return;
             }
+            app.finish(&id, false, "额度/连接异常，暂时冷却", 60000);
+            last = 502;
             continue;
         };
-        if b(&body, "stream") {
+        if stream {
             let failed = Arc::new(Mutex::new(false));
             let reader = StreamBody {
                 frames,

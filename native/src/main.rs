@@ -88,19 +88,49 @@ fn header(req: &Request, name: &'static str) -> String {
         .map(|h| h.value.as_str().to_owned())
         .unwrap_or_default()
 }
-fn body(req: &mut Request) -> Result<V> {
+const CHAT_BODY_LIMIT: usize = 128 * 1024 * 1024;
+struct BodyError {
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+fn read_json_body(req: &mut Request, limit: usize) -> std::result::Result<V, BodyError> {
+    let too_large = || BodyError {
+        status: 413,
+        code: "request_too_large",
+        message: format!("请求体超过本地反代限制（{} 字节）；请减少图片附件或压缩对话历史", limit),
+    };
+    if req.body_length().is_some_and(|size| size > limit) {
+        return Err(too_large());
+    }
+    let encoding = header(req, "Content-Encoding").trim().to_lowercase();
+    if !encoding.is_empty() && encoding != "identity" {
+        return Err(BodyError {
+            status: 415,
+            code: "unsupported_content_encoding",
+            message: "本地反代暂不支持压缩请求体，请发送未压缩的 JSON".into(),
+        });
+    }
     let mut bytes = Vec::new();
     req.as_reader()
-        .take(16 * 1024 * 1024 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > 16 * 1024 * 1024 {
-        return Err("请求过大".into());
+        .map_err(|_| BodyError { status: 400, code: "request_read_error", message: "请求体读取失败或传输中断".into() })?;
+    if bytes.len() > limit {
+        return Err(too_large());
     }
     if bytes.is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_slice(&bytes).map_err(|_| "JSON 格式错误".into())
+    serde_json::from_slice(&bytes).map_err(|e| BodyError {
+        status: 400,
+        code: "invalid_json",
+        // Parser location is useful without exposing input fragments or secrets.
+        message: format!("JSON 格式错误（第 {} 行，第 {} 列）", e.line(), e.column()),
+    })
+}
+fn body(req: &mut Request) -> Result<V> {
+    read_json_body(req, 16 * 1024 * 1024).map_err(|e| e.message)
 }
 
 struct State {
@@ -116,6 +146,7 @@ struct App {
     key: Vec<u8>,
     http: Client,
     auth: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    request_ids: Mutex<HashMap<String, (String, i64)>>,
     checkin: Mutex<()>,
     services: Mutex<()>,
     proxy: Mutex<Option<Arc<Server>>>,
@@ -198,6 +229,7 @@ impl App {
             key,
             http,
             auth: Mutex::new(HashMap::new()),
+            request_ids: Mutex::new(HashMap::new()),
             checkin: Mutex::new(()),
             services: Mutex::new(()),
             proxy: Mutex::new(None),

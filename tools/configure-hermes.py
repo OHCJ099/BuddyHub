@@ -25,6 +25,7 @@ def configure(home: Path):
             shutil.copy2(source, backup / name)
     provider["models"] = MODELS.copy()
     provider["discover_models"] = False
+    provider["session_affinity_header"] = "X-BuddyHub-Session-ID"
     provider.pop("models_discovered", None)
     extra = provider.get("extra_body", {})
     if isinstance(extra, dict):
@@ -55,7 +56,7 @@ def configure(home: Path):
                  if "127.0.0.1:8787" not in key and "localhost:8787" not in key
                  and "workbuddy" not in key.lower()}
         cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-    print(f"{home}: 已固定中国版、国际版两个 4.1 入口，移除思考强度覆盖与旧目录缓存")
+    print(f"{home}: 已固定两个 4.1 入口并启用会话标识，移除思考强度覆盖与旧目录缓存")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
