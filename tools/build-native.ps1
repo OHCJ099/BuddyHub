@@ -11,4 +11,6 @@ $targetRoot=if($env:CARGO_TARGET_DIR){$env:CARGO_TARGET_DIR}else{Join-Path $root
 if($Target){$targetRoot=Join-Path $targetRoot $Target}
 $dist=Join-Path $root 'dist'
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $targetRoot 'release\buddyhub-service.exe') -Destination $dist -Force
+foreach($name in 'buddyhub-service.exe','buddyhub-share.exe'){
+    Copy-Item -LiteralPath (Join-Path $targetRoot ('release\'+$name)) -Destination $dist -Force
+}

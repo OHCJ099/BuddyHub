@@ -6,6 +6,39 @@ use std::{
 };
 
 const HIDDEN: u32 = 0x08000000;
+pub fn decode_workbuddy_login(exe: &str, input: &V) -> Result<V> {
+    if !Path::new(exe).is_file() { return Err("未找到官方客户端".into()); }
+    let bytes = serde_json::to_vec(input).map_err(|_| "登录数据格式无效")?;
+    if bytes.len() > 1024 * 1024 { return Err("登录数据过大".into()); }
+    let mut child = Command::new(exe)
+        .args(["-e", include_str!("import-workbuddy.cjs")])
+        .env("ELECTRON_RUN_AS_NODE", "1").env("BUDDYHUB_IMPORT_LOGIN", "1")
+        .creation_flags(HIDDEN).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().map_err(|_| "无法读取客户端加密登录")?;
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = thread::spawn(move || stdin.write_all(&bytes));
+    let stdout = child.stdout.take().unwrap();
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(1024 * 1024 + 1).read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let started = Instant::now();
+    let success = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if started.elapsed() < Wait::from_secs(15) => thread::sleep(Wait::from_millis(25)),
+            _ => { let _ = child.kill(); let _ = child.wait(); break false; }
+        }
+    };
+    let _ = writer.join();
+    let bytes = reader.join().ok().and_then(|r| r.ok()).ok_or("读取加密登录失败")?;
+    if !success || bytes.len() > 1024 * 1024 { return Err("客户端加密登录暂不兼容".into()); }
+    let decoded: V = serde_json::from_slice(&bytes).map_err(|_| "客户端返回格式无效")?;
+    if decoded["account"]["uid"] != input["account"]["uid"] || decoded["auth"]["domain"] != input["auth"]["domain"] {
+        return Err("客户端账号信息不匹配".into());
+    }
+    Ok(decoded)
+}
 fn command(exe: &str, args: &[String]) -> Result<String> {
     let out = Command::new(exe)
         .args(args)

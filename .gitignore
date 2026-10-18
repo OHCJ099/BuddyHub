@@ -16,3 +16,12 @@ vault.key
 backups/
 private/
 .buddyhub/
+
+sharing*.json
+sharing*.enc
+ngrok.yml
+share/
+dist-next/
+
+!native/src/bin/
+!native/src/bin/*.rs

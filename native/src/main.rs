@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 mod proxy;
 mod service;
+mod sharing;
 #[cfg(test)]
 mod tests;
 
@@ -507,13 +508,24 @@ impl App {
                 }
             }
         }
-        let mut state = self.state.lock().unwrap();
         let (mut added, mut updated, mut unsupported) = (0, 0, 0);
         for file in files {
             let Ok(bytes) = fs::read(&file) else { continue };
-            let Ok(j) = serde_json::from_slice::<V>(&bytes) else {
+            let Ok(mut j) = serde_json::from_slice::<V>(&bytes) else {
                 continue;
             };
+            let source_hash = hex(&Sha256::digest(&bytes));
+            // Avoid starting the official runtime every minute for an unchanged login.
+            if self.state.lock().unwrap().accounts.iter().any(|a| s(a,"sourceHash") == source_hash) {
+                continue;
+            }
+            if j["auth"]["accessToken"]["$wbEncrypted"] == 1 {
+                let exe = if site_of(&s(&j["auth"], "domain")) == Some("ai") { s(&cfg,"workbuddyIntlExe") } else { s(&cfg,"workbuddyExe") };
+                match service::decode_workbuddy_login(&exe,&j) {
+                    Ok(decoded) => j = decoded,
+                    Err(_) => { unsupported += 1; continue; }
+                }
+            }
             let a = j.get("auth").unwrap_or(&j);
             let empty = json!({});
             let u = j.get("account").or_else(|| j.get("user")).unwrap_or(&empty);
@@ -538,11 +550,15 @@ impl App {
                 .unwrap_or_else(|| uid.to_string());
             let entstr = ent.as_str().unwrap_or("");
             let id = hex(&Sha256::digest(format!("{site}:{uidstr}:{entstr}")))[..20].to_owned();
+            let mut state = self.state.lock().unwrap();
             let old = state.accounts.iter_mut().find(|x| s(x, "id") == id);
             if old
                 .as_ref()
-                .is_some_and(|o| n(o, "expiresAt") >= n(a, "expiresAt"))
+                .is_some_and(|o| n(o, "expiresAt") > n(a, "expiresAt") ||
+                    (n(o,"expiresAt") == n(a,"expiresAt") && s(o,"accessToken") == s(a,"accessToken")))
             {
+                if let Some(o) = old { o["sourceHash"] = json!(source_hash); }
+                self.save_locked(&state)?;
                 continue;
             }
             let phone = s(u, "phoneNumber");
@@ -561,13 +577,17 @@ impl App {
             } else {
                 format!("账号 {}", &id[..6])
             };
-            let item = json!({"id":id,"site":site,"uid":uidstr,"enterpriseId":entstr,"domain":a["domain"],"label":label,"phoneSuffix":tail,"accessToken":a["accessToken"],"refreshToken":a.get("refreshToken").unwrap_or(&json!("")),"expiresAt":a["expiresAt"],"refreshExpiresAt":a["refreshExpiresAt"],"source":file.to_string_lossy(),"importedAt":now()});
+            let item = json!({"id":id,"site":site,"uid":uidstr,"enterpriseId":entstr,"domain":a["domain"],"label":label,"phoneSuffix":tail,"accessToken":a["accessToken"],"refreshToken":a.get("refreshToken").unwrap_or(&json!("")),"expiresAt":a["expiresAt"],"refreshExpiresAt":a["refreshExpiresAt"],"source":file.to_string_lossy(),"sourceHash":source_hash,"importedAt":now()});
             if let Some(o) = old {
                 for (k, v) in item.as_object().unwrap() {
                     o[k] = v.clone();
                 }
                 o["authState"] = json!("待验证");
-                o["cooldownUntil"] = json!(0);
+                if n(o,"upstreamCode") != 6004.0 || n(o,"cooldownUntil") <= now() as f64 {
+                    o["cooldownUntil"] = json!(0);
+                    o["upstreamCode"] = V::Null;
+                    o["lastError"] = json!("");
+                }
                 updated += 1;
             } else {
                 let mut item = item;
@@ -575,9 +595,9 @@ impl App {
                 state.accounts.push(item);
                 added += 1;
             }
+            self.save_locked(&state)?;
         }
         if added + updated > 0 {
-            self.save_locked(&state)?;
             self.log("导入账号", &format!("新增 {added}，更新 {updated}"));
         }
         Ok(json!({"added":added,"updated":updated,"unsupported":unsupported}))
@@ -704,6 +724,8 @@ fn admin(mut req: Request, app: Arc<App>) {
     let get = req.method().as_str() == "GET";
     let data = if get { Ok(json!({})) } else { body(&mut req) };
     let result=data.and_then(|d|->Result<V>{match route.as_str(){
+ "/admin/sharing" if get=>sharing::api(&app,&route,&d),
+ "/admin/sharing/settings" | "/admin/sharing/key" | "/admin/sharing/key-copy" if !get=>sharing::api(&app,&route,&d),
  "/admin/status" if get=>{let cfg=app.config();let mem=service::memory();Ok(json!({"ok":true,"now":china(),"accounts":app.public_accounts(),"services":app.service_snapshot(),"settings":{"defaultSite":cfg["defaultSite"],"checkinEnabled":cfg["checkinEnabled"],"checkinTime":cfg["checkinTime"],"startupGuard":cfg["startupGuard"],"port":cfg["port"]},"proxyRunning":app.proxy.lock().unwrap().is_some(),"checkinRunning":app.checkin.try_lock().is_err(),"dataDir":app.data.to_string_lossy(),"runtime":{"engine":"原生后台","workingBytes":mem.0,"privateBytes":mem.1,"uiAutoStart":false}}))},
  "/admin/logs" if get=>{let txt=fs::read_to_string(app.data.join("events.log")).unwrap_or_default();Ok(json!({"text":txt.lines().rev().take(120).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")}))},
  "/admin/client-config" if get=>Ok(json!({"url":format!("http://127.0.0.1:{}/v1",n(&cfg,"port")),"key":cfg["localKey"]})),
@@ -793,7 +815,7 @@ fn run() -> Result<()> {
         &app.data.join("daemon.pid"),
         std::process::id().to_string().as_bytes(),
     )?;
-    app.log("管理服务启动", &format!("版本 1.0.0 · 数据目录 {} · 账号 {}", app.data.display(), app.state.lock().unwrap().accounts.len()));
+    app.log("管理服务启动", &format!("版本 1.0.1 · 数据目录 {} · 账号 {}", app.data.display(), app.state.lock().unwrap().accounts.len()));
     let _ = app.import(false, None);
     app.guard(false)?;
     if b(&cfg, "proxyEnabled")

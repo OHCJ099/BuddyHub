@@ -31,7 +31,7 @@ public static class Program
         var cfg=Config;using var req=new HttpRequestMessage(body==null?HttpMethod.Get:HttpMethod.Post,$"http://127.0.0.1:{cfg["adminPort"]}/admin/{route}");
         req.Headers.Authorization=new("Bearer",cfg["adminKey"]!.GetValue<string>());
         if(body!=null)req.Content=new StringContent(JsonSerializer.Serialize(body),Encoding.UTF8,"application/json");
-        using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(route is "status" or "logs" or "client-config"?2:route is "checkin" or "balances"?180:75));
+        using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(route is "status" or "logs" or "client-config"?2:route=="sharing"?4:route is "checkin" or "balances"?180:75));
         HttpResponseMessage response;
         try{response=await Http.SendAsync(req,timeout.Token).ConfigureAwait(false);}
         catch(OperationCanceledException){Diagnostic(route+" timeout");throw new Exception("后台连接超时，将自动重试；也可以点击刷新");}
@@ -58,9 +58,9 @@ public static class Program
     }
     [STAThread] public static void Main(string[] args)
     {
-        if(args.Contains("--version")){Console.WriteLine("BuddyHub 1.0.0");return;}
+        if(args.Contains("--version")){Console.WriteLine("BuddyHub 1.0.1");return;}
         Directory.CreateDirectory(Data);
-        Diagnostic("窗口版本 1.0.0 · 数据目录 "+Data+" · 程序 "+Environment.ProcessPath);
+        Diagnostic("窗口版本 1.0.1 · 数据目录 "+Data+" · 程序 "+Environment.ProcessPath);
         if(args.Any(a=>a is "--background" or "--guard" or "--checkin"))
         {
             try{Launch(Path.Combine(Root,"buddyhub-service.exe"),args.Contains("--guard")?"--guard":args.Contains("--checkin")?"--checkin":"--ensure");}
@@ -72,7 +72,7 @@ public static class Program
     }
 }
 
-public sealed class HubForm:Form
+public sealed partial class HubForm:Form
 {
     static readonly Color Bg=Color.FromArgb(245,247,251),PanelBg=Color.White,TextColor=Color.FromArgb(33,45,62),Muted=Color.FromArgb(117,131,149),Accent=Color.FromArgb(18,146,119),SidebarBg=Color.FromArgb(18,35,55);
     readonly Label footer=new(){Dock=DockStyle.Fill,Text="正在连接后台…",ForeColor=Muted,TextAlign=ContentAlignment.MiddleLeft};
@@ -101,8 +101,8 @@ public sealed class HubForm:Form
         using(var stream=Assembly.GetExecutingAssembly().GetManifestResourceStream("BuddyHub.assets.buddyhub.png")!){var image=Image.FromStream(stream);sidebar.Controls.Add(new PictureBox{Image=new Bitmap(image),SizeMode=PictureBoxSizeMode.Zoom,Location=new Point(23,31),Size=new Size(42,42)});}
         sidebar.Controls.Add(new Label{Text="BuddyHub",AutoSize=true,Location=new Point(74,34),Font=new Font(Font.FontFamily,16,FontStyle.Bold),ForeColor=Color.White});sidebar.Controls.Add(new Label{Text="本地 AI 工作空间",AutoSize=true,Location=new Point(24,85),Font=new Font(Font.FontFamily,9),ForeColor=Color.FromArgb(143,165,186)});
         var nav=new FlowLayoutPanel{Location=new Point(14,150),Size=new Size(180,360),FlowDirection=FlowDirection.TopDown,WrapContents=false,BackColor=SidebarBg};
-        var names=new[]{"概览","中国版账号","国际版账号","本地服务","设置与日志"};var icons=new[]{"\uE80F","\uE716","\uE774","\uE968","\uE713"};
-        pages.AddRange(new[]{Dashboard(),AccountPage(cn,"cn"),AccountPage(ai,"ai"),ServicePage(),SettingsPage()});
+        var names=new[]{"概览","中国版账号","国际版账号","本地服务","公网共享","设置与日志"};var icons=new[]{"\uE80F","\uE716","\uE774","\uE968","\uE753","\uE713"};
+        pages.AddRange(new[]{Dashboard(),AccountPage(cn,"cn"),AccountPage(ai,"ai"),ServicePage(),SharingPage(),SettingsPage()});
         for(int i=0;i<names.Length;i++){int index=i;var button=new Button{Text=names[i],Size=new Size(180,48),FlatStyle=FlatStyle.Flat,TextAlign=ContentAlignment.MiddleLeft,Padding=new Padding(47,0,0,0),Margin=new Padding(0,0,0,8),BackColor=SidebarBg,ForeColor=Color.FromArgb(183,199,216),Cursor=Cursors.Hand};button.FlatAppearance.BorderSize=0;button.FlatAppearance.MouseOverBackColor=Color.FromArgb(32,52,73);button.Paint+=(_,e)=>{using var f=new Font("Segoe MDL2 Assets",14);TextRenderer.DrawText(e.Graphics,icons[index],f,new Point(18,15),button.ForeColor);};button.Click+=(_,_)=>Navigate(index);navigation.Add(button);nav.Controls.Add(button);}sidebar.Controls.Add(nav);
         var sidebarNote=new Label{Text="静默运行 · 本机处理\r\n窗口关闭后，后台继续工作",ForeColor=Color.FromArgb(143,165,186),Font=new Font(Font.FontFamily,9),AutoSize=false,Height=72,Dock=DockStyle.Bottom,Padding=new Padding(23,0,12,15)};sidebar.Controls.Add(sidebarNote);shell.Controls.Add(sidebar,0,0);
         var root=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(30,25,30,10),RowCount=3,ColumnCount=1,Margin=Padding.Empty};root.RowStyles.Add(new RowStyle(SizeType.Absolute,108));root.RowStyles.Add(new RowStyle(SizeType.Percent,100));root.RowStyles.Add(new RowStyle(SizeType.Absolute,36));shell.Controls.Add(root,1,0);
@@ -113,12 +113,12 @@ public sealed class HubForm:Form
         // Status polling must continue even while a startup or account operation is pending.
         timer.Tick+=async(_,_)=>await Refresh();
     }
-    void Navigate(int index){pageHost.Controls.Clear();var page=pages[index];page.Dock=DockStyle.Fill;pageHost.Controls.Add(page);pageTitle.Text=new[]{"概览","中国版账号","国际版账号","本地服务","设置与日志"}[index];pageSubtitle.Text=new[]{"让每天的重复操作，安静地自动完成。","每日签到、可用积分和账号轮询，一目了然。","独立管理国际版账号，与中国版分开调用。","把常用的本地反代，集中在一个地方管理。","调整自动化行为，查看最近的运行记录。"}[index];for(int i=0;i<navigation.Count;i++){navigation[i].BackColor=i==index?Color.FromArgb(34,60,79):SidebarBg;navigation[i].ForeColor=i==index?Color.FromArgb(92,227,195):Color.FromArgb(183,199,216);}}
+    void Navigate(int index){pageHost.Controls.Clear();var page=pages[index];page.Dock=DockStyle.Fill;pageHost.Controls.Add(page);pageTitle.Text=new[]{"概览","中国版账号","国际版账号","本地服务","公网共享","设置与日志"}[index];pageSubtitle.Text=new[]{"让每天的重复操作，安静地自动完成。","每日签到、可用积分和账号轮询，一目了然。","独立管理国际版账号，与中国版分开调用。","把常用的本地反代，集中在一个地方管理。","给朋友独立的连接方式，自己掌握调用范围。","调整自动化行为，查看最近的运行记录。"}[index];for(int i=0;i<navigation.Count;i++){navigation[i].BackColor=i==index?Color.FromArgb(34,60,79):SidebarBg;navigation[i].ForeColor=i==index?Color.FromArgb(92,227,195):Color.FromArgb(183,199,216);}if(ready&&index==4)_=Run(RefreshSharing);}
     static ListView List(){var l=new ListView{Dock=DockStyle.Fill,View=View.Details,FullRowSelect=true,MultiSelect=false,HideSelection=false,BackColor=PanelBg,ForeColor=TextColor,BorderStyle=BorderStyle.None,OwnerDraw=true};var height=new ImageList{ImageSize=new Size(1,44)};l.SmallImageList=height;l.DrawColumnHeader+=(_,e)=>{using var bg=new SolidBrush(Color.FromArgb(237,241,247));e.Graphics.FillRectangle(bg,e.Bounds);TextRenderer.DrawText(e.Graphics,e.Header!.Text,l.Font,new Rectangle(e.Bounds.X+14,e.Bounds.Y,e.Bounds.Width-16,e.Bounds.Height),Muted,TextFormatFlags.VerticalCenter|TextFormatFlags.Left);};l.DrawItem+=(_,e)=>{if(l.View!=View.Details)e.DrawDefault=true;};l.DrawSubItem+=(_,e)=>{bool selected=e.Item!.Selected;using var bg=new SolidBrush(selected?Color.FromArgb(224,243,238):e.ItemIndex%2==0?Color.White:Color.FromArgb(250,251,253));e.Graphics.FillRectangle(bg,e.Bounds);var text=e.SubItem!.Text;var color=text is "有效" or "运行中" or "今日已签到" or "签到成功"?Accent:text is "签到失败" or "需重新登录"?Color.FromArgb(193,80,72):TextColor;TextRenderer.DrawText(e.Graphics,text,l.Font,new Rectangle(e.Bounds.X+14,e.Bounds.Y,e.Bounds.Width-16,e.Bounds.Height),color,TextFormatFlags.VerticalCenter|TextFormatFlags.Left|TextFormatFlags.EndEllipsis);};return l;}
     static FlowLayoutPanel Flow()=>new(){Dock=DockStyle.Fill,AutoSize=false,WrapContents=true,BackColor=Bg};
     static void AddTab(TabControl tabs,string name,Control child){var tab=new TabPage(name){BackColor=Bg,ForeColor=TextColor,Padding=new Padding(14)};tab.Controls.Add(child);tabs.TabPages.Add(tab);}
     Button Btn(string text,Func<Task> action){bool primary=text is "立即签到中国版" or "全部签到" or "保存设置" or "启动";var b=new Button{Text=text,AutoSize=true,MinimumSize=new Size(72,40),Height=40,FlatStyle=FlatStyle.Flat,BackColor=primary?Accent:Color.White,ForeColor=primary?Color.White:TextColor,Padding=new Padding(13,7,13,7),Margin=new Padding(0,0,8,8),Cursor=Cursors.Hand};b.FlatAppearance.BorderSize=primary?0:1;b.FlatAppearance.BorderColor=Color.FromArgb(221,227,236);b.FlatAppearance.MouseOverBackColor=primary?Color.FromArgb(14,129,105):Color.FromArgb(235,241,248);b.Click+=async(_,_)=>await Run(action);return b;}
-    async Task Run(Func<Task> fn){if(busy)return;busy=true;footer.Text="正在处理…";try{await fn();if(!footer.Text.StartsWith("连接异常"))footer.Text="操作完成 · "+DateTime.Now.ToString("HH:mm:ss");}catch(Exception e){footer.Text=e.Message;Program.Diagnostic("操作失败 "+e.GetType().Name+" "+e.Message);runtimeBadge.Text="● 后台未连接";}finally{busy=false;}}
+    async Task Run(Func<Task> fn){if(busy)return;busy=true;footer.Text="正在处理…";try{await fn();if(!footer.Text.StartsWith("连接异常"))footer.Text="操作完成 · "+DateTime.Now.ToString("HH:mm:ss");}catch(Exception e){footer.Text=e.Message;Program.Diagnostic("操作失败 "+e.GetType().Name+" "+e.Message);}finally{busy=false;}}
     Control Dashboard()
     {
         var p=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=4,Padding=Padding.Empty};p.RowStyles.Add(new RowStyle(SizeType.Absolute,132));p.RowStyles.Add(new RowStyle(SizeType.Absolute,260));p.RowStyles.Add(new RowStyle(SizeType.Absolute,68));p.RowStyles.Add(new RowStyle(SizeType.Percent,100));
@@ -177,6 +177,7 @@ public sealed class HubForm:Form
             var memory=s["runtime"]?["workingBytes"]?.GetValue<long>()??0;runtimeBadge.Text=memory>0?$"● 后台 {memory/1048576d:0.0} MB":"● 后台运行中";
             if(!dirty){var was=ready;ready=false;autoSign.Checked=cfg["checkinEnabled"]!.GetValue<bool>();startupGuard.Checked=cfg["startupGuard"]!.GetValue<bool>();signTime.Text=cfg["checkinTime"]!.ToString();defaultPool.SelectedIndex=cfg["defaultSite"]!.ToString()=="ai"?1:0;ready=was;}
             var l=await Program.Api("logs");var text=l["text"]!.ToString().Replace("\n",Environment.NewLine);if(logs.Text!=text){logs.Text=text;logs.SelectionStart=logs.TextLength;logs.ScrollToCaret();}if(!busy)footer.Text=s["checkinRunning"]?.GetValue<bool>()==true?"正在后台自动签到，完成后会更新账号记录":"已更新 · "+DateTime.Now.ToString("HH:mm:ss")+" · 后台服务运行中";
+            if(pageTitle.Text=="公网共享"&&!busy){try{await RefreshSharing();}catch(Exception e){footer.Text="公网共享："+e.Message;}}
         }catch(Exception e){footer.Text="连接异常："+e.Message;runtimeBadge.Text="● 后台未连接";Program.Diagnostic("刷新失败 "+e.GetType().Name+" "+e.Message);}finally{refreshing=false;}
     }
     static string[] AccountFields(JsonNode a,string today){var c=a["checkin"];var isToday=c?["date"]?.ToString()==today;return new[]{a["label"]!.ToString(),string.IsNullOrEmpty(a["phoneSuffix"]?.ToString())?"—":"****"+a["phoneSuffix"],a["enabled"]!.GetValue<bool>()?a["authState"]!.ToString():"已停用",a["balance"]?.ToString()??"未查询",a["site"]!.ToString()=="ai"?"不参与":isToday?c?["status"]?.ToString()??"待签到":"待签到",isToday?c?["credit"]?.ToString()??"—":"—",a["requests"]?.ToString()??"0",a["successes"]?.ToString()??"0",a["failures"]?.ToString()??"0"};}

@@ -36,20 +36,37 @@ struct UpstreamFailure {
     rotate: bool,
     code: Option<i64>,
     message: String,
+    retry_at: Option<i64>,
+}
+fn quota_reset_at(message: &str) -> Option<i64> {
+    // Only accept the upstream's explicitly identified UTC+8 timestamp, never
+    // echo arbitrary error text, account data or prompts.
+    let before = message.split_once(" UTC+8")?.0;
+    let date = before.get(before.len().checked_sub(19)?..)?;
+    let local = chrono::NaiveDateTime::parse_from_str(date, "%Y-%m-%d %H:%M:%S").ok()?;
+    let reset = (local - Duration::hours(8)).and_utc().timestamp_millis();
+    (reset > now()).then_some(reset)
 }
 impl UpstreamFailure {
     fn classify(status: u16, value: &V) -> Self {
         let code = value["code"].as_i64().or_else(|| value["error"]["code"].as_i64());
         let msg = value["msg"].as_str().or_else(|| value["error"]["message"].as_str())
             .or_else(|| value["message"].as_str()).or_else(|| value.as_str()).unwrap_or("");
+        let retry_at = if code == Some(6004) { quota_reset_at(msg) } else { None };
+        let status = if code == Some(6004) { 429 } else { status };
         let rotate = code != Some(11128) && (status == 429 || status >= 500
             || [401, 403].contains(&status) || matches!(code, Some(401 | 403 | 429 | 10001)) || quota(msg));
         // Unknown upstream messages can contain credentials or echoed prompts.
         // Return reviewed summaries and numeric business codes only.
         let message = if code == Some(11128) {
             "上游会话信息缺失（conversation id missing）".to_owned()
+        } else if code == Some(6004) {
+            if let Some(at) = retry_at {
+                let date = (chrono::DateTime::from_timestamp_millis(at).unwrap() + Duration::hours(8)).format("%Y-%m-%d %H:%M:%S");
+                format!("上游使用频率额度已达上限，将于 {date}（北京时间）重置")
+            } else { "上游使用频率额度已达上限，重置时间请以官方客户端提示为准".into() }
         } else { format!("上游拒绝请求，HTTP {status}") };
-        Self { status, rotate, code, message }
+        Self { status, rotate, code, message, retry_at }
     }
     fn read(status: u16, response: reqwest::blocking::Response) -> Self {
         let mut bytes = Vec::new();
@@ -63,6 +80,9 @@ impl UpstreamFailure {
         let mut result = json!({"error":{"message":self.message,"type":"upstream_error"}});
         if let Some(code) = self.code { result["error"]["code"] = json!(code); }
         result
+    }
+    fn cooldown_ms(&self) -> i64 {
+        if !self.rotate { 0 } else { self.retry_at.map(|at| (at - now()).max(1000)).unwrap_or(60000) }
     }
 }
 fn parse_model(id: &str, default: &str) -> Result<(String, String, Option<String>)> {
@@ -89,6 +109,10 @@ fn parse_model(id: &str, default: &str) -> Result<(String, String, Option<String
         let m = m.to_owned();
         upstream = m;
         "ai"
+    } else if let Some(m) = upstream.strip_suffix("-auto") {
+        let m = m.to_owned();
+        upstream = m;
+        "auto"
     } else {
         default
     };
@@ -100,8 +124,8 @@ fn parse_model(id: &str, default: &str) -> Result<(String, String, Option<String
 fn models() -> V {
     let mut ids = Vec::new();
     for m in MODELS {
-        // Regions select independent pools; reasoning is a request parameter, not a model.
-        for site in ["cn", "ai"] {
+        // Explicit regions stay isolated; auto opts into both independent pools.
+        for site in ["cn", "ai", "auto"] {
             ids.push(format!("{m}-{site}"));
         }
     }
@@ -358,6 +382,38 @@ impl Read for StreamBody {
     }
 }
 impl App {
+    fn record_failure(&self, id: &str, error: &UpstreamFailure) {
+        self.finish_with_code(id, false, &error.message, error.cooldown_ms(), error.code);
+    }
+    fn unavailable_pool(&self, site: &str, fallback: u16) -> (u16, V, Option<i64>) {
+        let state = self.state.lock().unwrap();
+        let pool = state.accounts.iter().filter(|a| b(a,"enabled") &&
+            (s(a,"site") == site || (site == "auto" && ["cn","ai"].contains(&s(a,"site").as_str())))).collect::<Vec<_>>();
+        let invalid = pool.iter().filter(|a| s(a,"authState") == "需重新登录").count();
+        let valid = pool.len() - invalid;
+        let cooling = pool.iter().filter(|a| s(a,"authState") != "需重新登录" && n(a,"cooldownUntil") > now() as f64).collect::<Vec<_>>();
+        let limited = cooling.iter().filter(|a| n(a,"upstreamCode") == 6004.0).count();
+        let earliest = cooling.iter().map(|a| n(a,"cooldownUntil") as i64).min();
+        let status = if valid > 0 && limited == valid { 429 }
+            else if !pool.is_empty() && invalid == pool.len() { 401 } else { fallback };
+        let mut message = if pool.is_empty() { format!("{} 号池暂无启用账号", site.to_uppercase()) }
+            else { format!("{} 号池暂无可用账号：{invalid} 个需重新登录，{limited} 个使用频率受限，{} 个暂时冷却", site.to_uppercase(), cooling.len() - limited) };
+        if let Some(at) = earliest {
+            if let Some(date) = chrono::DateTime::from_timestamp_millis(at) {
+                message.push_str(&format!("；最早可重试：{}（北京时间）", (date + Duration::hours(8)).format("%Y-%m-%d %H:%M:%S")));
+            }
+        }
+        let mut result = json!({"error":{"message":message,"type":"pool_unavailable"}});
+        if valid > 0 && limited == valid { result["error"]["code"] = json!(6004); }
+        // A known, hours-long AI quota window cannot recover inside one chat turn.
+        // Keep HTTP 429 and Retry-After for other clients, while allowing Hermes to
+        // show the real reset time immediately instead of silently waiting 600s.
+        if site == "ai" && status == 429 && earliest.is_some_and(|at|at > now()+600_000) {
+            result["error"]["retryable"] = json!(false);
+            result["error"]["reset_at"] = json!(earliest.unwrap()/1000);
+        }
+        (status, result, earliest.map(|at| ((at - now() + 999) / 1000).max(1)))
+    }
     fn cached_request_id(&self, key: String) -> String {
         let mut cache = self.request_ids.lock().unwrap();
         if let Some((id, touched)) = cache.get_mut(&key) {
@@ -402,6 +458,18 @@ impl App {
     }
     fn pick(&self, site: &str, excluded: &[String]) -> Option<V> {
         let mut state = self.state.lock().unwrap();
+        // Alternate regions first, then use each region's existing account cursor.
+        // A region with no eligible account is skipped immediately.
+        let site = if site == "auto" {
+            let regions = ["cn", "ai"];
+            let start = state.cursor.get("auto").copied().unwrap_or(0) % regions.len();
+            let selected = (0..regions.len()).map(|offset| (start + offset) % regions.len())
+                .find(|index| state.accounts.iter().any(|a| b(a,"enabled") &&
+                    s(a,"site") == regions[*index] && !excluded.contains(&s(a,"id")) &&
+                    s(a,"authState") != "需重新登录" && n(a,"cooldownUntil") <= now() as f64))?;
+            state.cursor.insert("auto".into(), selected + 1);
+            regions[selected]
+        } else { site };
         let pool = state
             .accounts
             .iter()
@@ -433,15 +501,23 @@ impl App {
         Some(a)
     }
     fn finish(&self, id: &str, ok: bool, error: &str, cool: i64) {
+        self.finish_with_code(id, ok, error, cool, None);
+    }
+    fn finish_with_code(&self, id: &str, ok: bool, error: &str, cool: i64, code: Option<i64>) {
         let mut state = self.state.lock().unwrap();
         let count = state.inflight.entry(id.into()).or_insert(0);
         *count = count.saturating_sub(1);
         if let Some(a) = state.accounts.iter_mut().find(|a| s(a, "id") == id) {
             let key = if ok { "successes" } else { "failures" };
             a[key] = json!(n(a, key) + 1.0);
-            a["lastError"] = json!(error);
-            a["cooldownUntil"] = json!(if cool > 0 { now() + cool } else { 0 });
-            if ok {
+            // An older in-flight response must not erase a known quota window.
+            let keep_quota = n(a,"upstreamCode") == 6004.0 && n(a,"cooldownUntil") > now() as f64;
+            if !keep_quota || code == Some(6004) {
+                a["lastError"] = json!(error);
+                a["cooldownUntil"] = json!(if cool > 0 { now() + cool } else { 0 });
+                a["upstreamCode"] = json!(code);
+            }
+            if ok && s(a,"authState") != "需重新登录" {
                 a["authState"] = json!("有效");
             }
         }
@@ -491,7 +567,7 @@ impl App {
                             return Ok(r);
                         }
                         last = UpstreamFailure::read(code, r);
-                        if !last.rotate {
+                        if !last.rotate || last.code == Some(6004) {
                             return Err(last);
                         }
                         break;
@@ -594,12 +670,7 @@ fn handle(mut req: Request, app: Arc<App>) {
             Err(error) => {
                 let code = error.status;
                 let rotate = error.rotate;
-                app.finish(
-                    &id,
-                    false,
-                    &error.message,
-                    if rotate { 60000 } else { 0 },
-                );
+                app.record_failure(&id, &error);
                 last = code;
                 if rotate {
                     app.log(
@@ -618,15 +689,13 @@ fn handle(mut req: Request, app: Arc<App>) {
             done: false,
         };
         let mut first = None;
-        let mut nonretry = None;
+        let mut failure = None;
         for _ in 0..200 {
             match frames.next() {
                 Ok(Some(raw)) => {
                     if business(&raw) {
                         let error = UpstreamFailure::classify(400, &raw);
-                        if !error.rotate {
-                            nonretry = Some(error);
-                        }
+                        failure = Some(error);
                         break;
                     }
                     if normalize(&raw, &requested).is_some() {
@@ -638,11 +707,15 @@ fn handle(mut req: Request, app: Arc<App>) {
             }
         }
         let Some(first) = first else {
-            if let Some(e) = nonretry {
-                app.finish(&id, false, &e.message, 0);
-                app.log("上游拒绝", &format!("{site} SSE code={:?}", e.code));
-                respond(req, e.status, e.json());
-                return;
+            if let Some(e) = failure {
+                app.record_failure(&id, &e);
+                if !e.rotate {
+                    app.log("上游拒绝", &format!("{site} SSE code={:?}", e.code));
+                    respond(req, e.status, e.json());
+                    return;
+                }
+                last = e.status;
+                continue;
             }
             app.finish(&id, false, "额度/连接异常，暂时冷却", 60000);
             last = 502;
@@ -693,16 +766,30 @@ fn handle(mut req: Request, app: Arc<App>) {
             }
         }
     }
-    respond(
-        req,
-        last,
-        json!({"error":{"message":format!("{} 号池暂无可用账号，请检查登录、额度或冷却状态",site.to_uppercase()),"type":"pool_unavailable"}}),
-    );
+    let (status, error, retry) = app.unavailable_pool(&site, last);
+    let mut response = Response::from_data(serde_json::to_vec(&error).unwrap())
+        .with_status_code(StatusCode(status))
+        .with_header(Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap());
+    if let Some(seconds) = retry {
+        response.add_header(Header::from_bytes("Retry-After", seconds.to_string()).unwrap());
+    }
+    let _ = req.respond(response);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quota_reset_rejects_unknown_or_past_timestamps_and_private_text() {
+        for msg in ["private-secret", "2000-01-01 12:00:00 UTC+8 private-secret",
+            "2099-01-01 12:00:00 UTC+9 private-secret", "garbled UTC+8 private-secret"] {
+            let failure = UpstreamFailure::classify(400, &json!({"code":6004,"msg":msg}));
+            assert_eq!(failure.status,429);
+            assert_eq!(failure.retry_at,None);
+            assert_eq!(failure.cooldown_ms(),60000);
+            assert!(!failure.message.contains("private-secret"));
+        }
+    }
     #[test]
     fn routing() {
         assert_eq!(
@@ -721,7 +808,7 @@ mod tests {
             site
         }).collect::<std::collections::HashSet<_>>();
         assert_eq!(entries.len(), sites.len());
-        assert_eq!(sites, ["cn".to_owned(), "ai".to_owned()].into_iter().collect());
+        assert_eq!(sites, ["cn".to_owned(), "ai".to_owned(), "auto".to_owned()].into_iter().collect());
     }
     #[test]
     fn compatibility() {

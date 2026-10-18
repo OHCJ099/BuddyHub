@@ -7,6 +7,14 @@ if (!(Test-Path -LiteralPath $exePath)) { throw '请先编译 BuddyHub' }
 if (!(Test-Path -LiteralPath $servicePath)) { throw '请先编译原生后台' }
 $dataDir = if($env:BUDDYHUB_DATA){$env:BUDDYHUB_DATA}else{Join-Path $env:USERPROFILE '.buddyhub'}
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+$sharingBinary=Join-Path $releaseDir 'buddyhub-share.exe'
+$sharingTarget=Join-Path $dataDir 'share\buddyhub-share.exe'
+if(Test-Path -LiteralPath $sharingBinary){
+    New-Item -ItemType Directory -Path (Split-Path -Parent $sharingTarget) -Force | Out-Null
+    $running=Get-Process buddyhub-share -ErrorAction SilentlyContinue | Where-Object {$_.Path -eq $sharingTarget}
+    if(!$running){Copy-Item -LiteralPath $sharingBinary -Destination $sharingTarget -Force}
+    else{Write-Warning '共享后台正在运行；更新该组件前，请先在旧窗口关闭公网服务，再运行安装。'}
+}
 $aclUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 & icacls.exe $dataDir '/inheritance:r' '/grant:r' ($aclUser + ':(OI)(CI)F') 'SYSTEM:(OI)(CI)F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw '无法限制数据目录权限' }

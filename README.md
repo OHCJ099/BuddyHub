@@ -6,7 +6,7 @@
 
 ## 下载与安装
 
-到 [Releases](https://github.com/OHCJ099/BuddyHub/releases/latest) 下载 `BuddyHub-v1.0.0-windows-x64.zip`，解压到固定目录，双击 `setup.cmd`。
+到 [Releases](https://github.com/OHCJ099/BuddyHub/releases/latest) 下载 `BuddyHub-v1.0.1-windows-x64.zip`，解压到固定目录，双击 `setup.cmd`。
 
 - 支持 Windows 10/11 x64。下载包内含 .NET 运行时，不需要安装 Node.js、Python 或 Rust。
 - 安装脚本会创建桌面入口、登录后台启动项、每日备用检查任务及每分钟恢复检查。不会自动打开管理窗口。
@@ -31,11 +31,12 @@
 Base URL: http://127.0.0.1:8787/v1
 中国版模型: deepseek-v4.1-flash-cn
 国际版模型: deepseek-v4.1-flash-ai
+双区轮询模型: deepseek-v4.1-flash-auto
 ```
 
-同一区域内轮询账号，中国版与国际版不会交叉回退。模型目录只公布以上两个入口，不展开不同思考强度的别名。思考强度通过客户端的 `reasoning_effort` 传入。
+`-cn` 与 `-ai` 同一区域内轮询，不会交叉回退；`-auto` 由用户显式选择，允许中国版和国际版共同轮询。模型目录只公布以上三个入口，不展开不同思考强度的别名。思考强度通过客户端的 `reasoning_effort` 传入。
 
-Hermes 中添加 OpenAI 兼容服务商，填入上述地址和密钥，再添加两个模型。仓库中的 `tools/configure-hermes.py` 可用于整理已经存在的 `workbuddy` 服务商配置；运行前需要 Python 和 PyYAML，工具会备份原文件。普通使用无需此脚本。
+Hermes 中添加 OpenAI 兼容服务商，填入上述地址和密钥，再添加上述模型。仓库中的 `tools/configure-hermes.py` 可用于整理已经存在的 `workbuddy` 服务商配置；运行前需要 Python 和 PyYAML，工具会备份原文件。普通使用无需此脚本。
 
 如需在 Hermes 的多轮工具调用和上下文压缩中保持稳定会话，可在已有服务商配置中添加：
 
@@ -48,6 +49,34 @@ providers:
 以上是需合并的字段，请保留原有地址、模型和密钥配置。桥接工具会自动添加此字段。其他客户端也可发送 `X-BuddyHub-Session-ID`，同一聊天保持不变，不同聊天使用不同值；没有会话头时按初始上下文回退，相同开场白的独立聊天无法靠此回退保证区分。
 
 反代为每个账号分别维护会话与用户轮次标识，并为每次模型调用生成新的消息标识；同一区域继续按请求轮询，每次发送完整消息历史。
+
+## v1.0.1 更新
+
+- 新增「公网共享」：ngrok 隧道开关、独立 Key、每日 / 每月 / 累计请求数、速率、并发、有效期和模型限制；支持单独复制纯 Key、纯 URL。
+- 新增 `-auto` 双区轮询，原有 `-cn` / `-ai` 隔离策略保持。
+- 支持新版官方客户端的加密登录导入，保留账号和上游限流时间。
+- 国际版长时间限流返回 `retryable: false` 和 `reset_at`，客户端可及时提示；上游限流不能由本地解除。旧版 Hermes 可能仍按自己的重试策略等待。
+- Hermes 桥接脚本补齐视觉声明与会话头。中国版已通过真实图片识别；国际版链路因上游限流尚未实测。
+
+### 可选公网共享
+
+默认关闭。先注册自己的 ngrok 账号，从 [ngrok 官方下载页](https://ngrok.com/downloads/windows) 获取 Windows x64 客户端，将 `ngrok.exe` 放在 `%USERPROFILE%\.buddyhub\share\`。在「公网共享 → 隧道设置」保存自己的 Authtoken，新增朋友使用的 Key，再开启服务。分享窗口中的 URL 和独立 Key 即可；不要分享本地管理密钥或 ngrok 凭据。电脑及隧道需保持在线，额度以 ngrok 当前计划为准。详见 [公网共享说明](SHARING.md)。
+
+Hermes 手动添加模型时，在每个模型条目填写 `supports_vision: true`，例如：
+
+```yaml
+providers:
+  workbuddy:
+    models:
+      deepseek-v4.1-flash-cn:
+        supports_vision: true
+      deepseek-v4.1-flash-ai:
+        supports_vision: true
+      deepseek-v4.1-flash-auto:
+        supports_vision: true
+```
+
+合并到已有配置，保留地址和密钥。也可使用发布包中的 `tools/configure-hermes.py`。
 
 ## 2026-10-17 稳定性修复
 

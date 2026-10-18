@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "buddyhub-service"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",

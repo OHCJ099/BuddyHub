@@ -2,26 +2,24 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
-fn first_run_initializes_empty_encrypted_vault_without_rotating_keys() {
-    let data=std::env::temp_dir().join(format!("buddyhub-init-test-{}",hex(&random(8))));
-    initialize_data(&data).unwrap();
-    let config=fs::read(data.join("config.json")).unwrap();
-    let key=fs::read(data.join("vault.key")).unwrap();
-    let cfg:V=serde_json::from_slice(&config).unwrap();
-    assert_ne!(s(&cfg,"localKey"),s(&cfg,"adminKey"));
-    let blob:V=serde_json::from_slice(&fs::read(data.join("accounts.enc")).unwrap()).unwrap();
-    let mut ciphertext=B64.decode(s(&blob,"data")).unwrap();
-    ciphertext.extend(B64.decode(s(&blob,"tag")).unwrap());
-    let iv=B64.decode(s(&blob,"iv")).unwrap();
-    let plain=Aes256Gcm::new_from_slice(&key).unwrap().decrypt(Nonce::from_slice(&iv),ciphertext.as_ref()).unwrap();
-    assert_eq!(plain,b"[]");
-    initialize_data(&data).unwrap();
-    assert_eq!(config,fs::read(data.join("config.json")).unwrap());
-    assert_eq!(key,fs::read(data.join("vault.key")).unwrap());
-    fs::remove_file(data.join("vault.key")).unwrap();
-    assert!(initialize_data(&data).is_err());
-    assert!(data.join("accounts.enc").exists());
-    fs::remove_dir_all(data).unwrap();
+fn sharing_key_rotation_preserves_identity_usage_and_encrypted_secrets() {
+    let f=fixture();
+    let mut d=json!({"name":"test friend","key":"test-public-sharing-key","enabled":true,"dailyRequests":100,"monthlyRequests":2000,"totalRequests":0,"requestsPerMinute":10,"concurrency":2,"models":["deepseek-v4.1-flash-auto"]});
+    let created=sharing::api(&f.app,"/admin/sharing/key",&d).unwrap();
+    let id=s(&created,"id");
+    let config_before=fs::read_to_string(f.app.data.join("sharing.json")).unwrap();
+    assert!(!config_before.contains("test-public-sharing-key"));
+    let encrypted=fs::read(f.app.data.join("sharing-secrets.enc")).unwrap();
+    assert!(!String::from_utf8_lossy(&encrypted).contains("test-public-sharing-key"));
+    atomic(&f.app.data.join("sharing-usage.json"),serde_json::to_vec(&json!({"date":china()["date"],"keys":{&id:7}})).unwrap().as_slice()).unwrap();
+    d["id"]=json!(id);d["key"]=json!("");d["rotate"]=json!(true);
+    let changed=sharing::api(&f.app,"/admin/sharing/key",&d).unwrap();assert_eq!(created,changed);
+    let copied=sharing::api(&f.app,"/admin/sharing/key-copy",&json!({"id":id})).unwrap();assert_ne!(s(&copied,"key"),"test-public-sharing-key");
+    let status=sharing::api(&f.app,"/admin/sharing",&json!({})).unwrap();
+    assert_eq!(status["keys"][0]["usedToday"],7);assert_eq!(status["keys"][0]["usedTotal"],7);
+    let public=status.to_string();assert!(!public.contains(&s(&copied,"key")));assert!(!public.contains("sha256"));
+    let mut duplicate=d.clone();duplicate.as_object_mut().unwrap().remove("id");duplicate["key"]=copied["key"].clone();
+    assert!(sharing::api(&f.app,"/admin/sharing/key",&duplicate).is_err());
 }
 
 struct Fixture {
@@ -551,4 +549,140 @@ fn native_empty_pool_and_unknown_model_do_not_call_other_region() {
         401
     );
     assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn only_long_ai_quota_windows_declare_this_turn_nonretryable() {
+    let f=fixture();
+    let url=proxy_url(&f.app);
+    for (id,site,delay,terminal) in [("ai1","ai",3_600_000,true),("ai1","ai",60_000,false),("cn1","cn",3_600_000,false)] {
+        f.app.update(id,json!({"upstreamCode":6004,"cooldownUntil":now()+delay})).unwrap();
+        if site=="cn" {f.app.update("cn2",json!({"enabled":false})).unwrap();}
+        let response=chat(&f.app,&url,&format!("deepseek-v4.1-flash-{site}"),true);
+        assert_eq!(response.status().as_u16(),429);
+        assert!(response.headers()["Retry-After"].to_str().unwrap().parse::<i64>().unwrap()>0);
+        let error:V=response.json().unwrap();assert_eq!(error["error"]["code"],6004);
+        assert_eq!(error["error"]["retryable"]==false,terminal);
+        if terminal {assert!(error["error"]["reset_at"].as_i64().unwrap()>now()/1000);}
+    }
+}
+
+#[test]
+fn native_quota_reset_is_persisted_and_blocks_repeat_requests() {
+    for sse in [false, true] {
+        let f = fixture();
+        f.app.update("cn1", json!({"authState":"需重新登录"})).unwrap();
+        let reset = ((now() + 3600000) / 1000) * 1000;
+        let date = (chrono::DateTime::from_timestamp_millis(reset).unwrap() + Duration::hours(8))
+            .format("%Y-%m-%d %H:%M:%S").to_string();
+        let count = Arc::new(AtomicUsize::new(0));
+        let saved = count.clone();
+        let m = mock(move |req| {
+            assert_eq!(header(&req,"X-User-Id"), "cn2");
+            saved.fetch_add(1, Ordering::SeqCst);
+            let error = json!({"code":6004,"msg":format!("将在 {date} UTC+8 重置 private-secret")});
+            if sse { let _ = req.respond(Response::from_string(format!("data: {error}\n\n"))); }
+            else { respond(req,429,error); }
+        });
+        bind(&f.app,&m);
+        let url = proxy_url(&f.app);
+        for _ in 0..2 {
+            let response = chat(&f.app,&url,"deepseek-v4.1-flash-cn",sse);
+            assert_eq!(response.status().as_u16(),429);
+            let retry = response.headers()["Retry-After"].to_str().unwrap().parse::<i64>().unwrap();
+            assert!((3500..=3600).contains(&retry));
+            let text = response.text().unwrap();
+            let value: V = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["error"]["code"],6004);
+            assert!(text.contains("1 个需重新登录"));
+            assert!(text.contains("1 个使用频率受限"));
+            assert!(!text.contains("private-secret"));
+        }
+        assert_eq!(count.load(Ordering::SeqCst),1);
+        let account = f.app.account("cn2").unwrap();
+        assert!((n(&account,"cooldownUntil") as i64-reset).abs() < 1000);
+        let blob: V = serde_json::from_slice(&fs::read(f.app.data.join("accounts.enc")).unwrap()).unwrap();
+        let iv = B64.decode(s(&blob,"iv")).unwrap();
+        let mut cipher = B64.decode(s(&blob,"data")).unwrap();
+        cipher.extend(B64.decode(s(&blob,"tag")).unwrap());
+        let plain = Aes256Gcm::new_from_slice(&f.app.key).unwrap()
+            .decrypt(Nonce::from_slice(&iv),cipher.as_ref()).unwrap();
+        let data: Vec<V> = serde_json::from_slice(&plain).unwrap();
+        let restored = data.iter().find(|a| s(a,"id")=="cn2").unwrap();
+        assert_eq!(restored["upstreamCode"],6004);
+        assert!(n(restored,"cooldownUntil") > now() as f64);
+        assert_eq!(n(&f.app.account("ai1").unwrap(),"requests"),0.0);
+    }
+}
+
+#[test]
+fn native_invalid_pool_returns_login_cause_without_upstream_call() {
+    let f = fixture();
+    for id in ["cn1","cn2"] { f.app.update(id,json!({"authState":"需重新登录"})).unwrap(); }
+    let url = proxy_url(&f.app);
+    let response = chat(&f.app,&url,"deepseek-v4.1-flash-cn",false);
+    assert_eq!(response.status().as_u16(),401);
+    assert!(response.text().unwrap().contains("2 个需重新登录"));
+    assert_eq!(n(&f.app.account("ai1").unwrap(),"requests"),0.0);
+}
+
+#[test]
+fn native_new_login_with_equal_expiry_keeps_quota_and_caches_source() {
+    let f = fixture();
+    let id=hex(&Sha256::digest("cn:cn1:"))[..20].to_owned();
+    let expires=f.app.account("cn1").unwrap()["expiresAt"].clone();
+    let reset=now()+3600000;
+    f.app.update("cn1",json!({"id":id,"authState":"需重新登录","upstreamCode":6004,"cooldownUntil":reset})).unwrap();
+    let file=f.app.data.join("fresh-login.info");
+    fs::write(&file,serde_json::to_vec(&json!({"auth":{"domain":"www.workbuddy.cn","accessToken":"fresh-fake-token","refreshToken":"fresh-fake-refresh","expiresAt":expires},"account":{"uid":"cn1","nickname":"fixture"}})).unwrap()).unwrap();
+    let imported=f.app.import(false,file.to_str()).unwrap();
+    assert_eq!(imported["updated"],1);
+    let account=f.app.account(&id).unwrap();
+    assert_eq!(account["accessToken"],"fresh-fake-token");
+    assert_eq!(account["authState"],"待验证");
+    assert_eq!(account["cooldownUntil"],reset);
+    assert_eq!(account["upstreamCode"],6004);
+    assert_eq!(s(&account,"sourceHash").len(),64);
+    assert_eq!(f.app.import(false,file.to_str()).unwrap()["updated"],0);
+    assert_eq!(f.app.state.lock().unwrap().accounts.len(),3);
+}
+
+#[test]
+fn native_auto_alternates_regions_and_rotates_accounts_within_each_region() {
+    let f=fixture();
+    let calls=Arc::new(Mutex::new(Vec::new()));
+    let saved=calls.clone();
+    let m=mock(move |req| {saved.lock().unwrap().push(header(&req,"X-User-Id"));ok_stream(req);});
+    bind(&f.app,&m);
+    let url=proxy_url(&f.app);
+    for _ in 0..6 {
+        let response=chat(&f.app,&url,"deepseek-v4.1-flash-auto",false);
+        assert_eq!(response.status().as_u16(),200);
+        assert_eq!(response.json::<V>().unwrap()["model"],"deepseek-v4.1-flash-auto");
+        while f.app.state.lock().unwrap().inflight.values().any(|n|*n>0) {thread::sleep(Wait::from_millis(1));}
+    }
+    assert_eq!(*calls.lock().unwrap(),vec!["cn1","ai1","cn2","ai1","cn1","ai1"]);
+}
+
+#[test]
+fn native_auto_fails_over_and_explicit_region_remains_isolated() {
+    let f=fixture();
+    f.app.update("cn2",json!({"authState":"需重新登录"})).unwrap();
+    let calls=Arc::new(Mutex::new(Vec::new()));
+    let saved=calls.clone();
+    let m=mock(move |req| {
+        let uid=header(&req,"X-User-Id");saved.lock().unwrap().push(uid.clone());
+        if uid=="cn1" { respond(req,429,json!({"code":6004,"msg":"rate limited"})); }
+        else {ok_stream(req);}
+    });
+    bind(&f.app,&m);
+    let url=proxy_url(&f.app);
+    let r=chat(&f.app,&url,"deepseek-v4.1-flash-auto",true);
+    assert_eq!(r.status().as_u16(),200);
+    assert!(r.text().unwrap().contains("deepseek-v4.1-flash-auto"));
+    assert_eq!(chat(&f.app,&url,"deepseek-v4.1-flash-cn",false).status().as_u16(),429);
+    assert_eq!(*calls.lock().unwrap(),vec!["cn1","ai1"]);
+    let r=chat(&f.app,&url,"deepseek-v4.1-flash-auto",false);
+    assert_eq!(r.status().as_u16(),200);r.text().unwrap();
+    assert_eq!(*calls.lock().unwrap(),vec!["cn1","ai1","ai1"]);
 }

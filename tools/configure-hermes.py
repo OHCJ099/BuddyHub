@@ -8,7 +8,7 @@ import re
 import shutil
 import yaml
 
-MODELS = ["deepseek-v4.1-flash-cn", "deepseek-v4.1-flash-ai"]
+MODELS = ["deepseek-v4.1-flash-cn", "deepseek-v4.1-flash-ai", "deepseek-v4.1-flash-auto"]
 
 def configure(home: Path):
     path = home / "config.yaml"
@@ -23,9 +23,10 @@ def configure(home: Path):
         source = home / name
         if source.exists():
             shutil.copy2(source, backup / name)
-    provider["models"] = MODELS.copy()
-    provider["discover_models"] = False
+    existing = provider.get("models", {})
+    provider["models"] = {name: {**(existing.get(name, {}) if isinstance(existing, dict) and isinstance(existing.get(name, {}), dict) else {}), "supports_vision": True} for name in MODELS}
     provider["session_affinity_header"] = "X-BuddyHub-Session-ID"
+    provider["discover_models"] = False
     provider.pop("models_discovered", None)
     extra = provider.get("extra_body", {})
     if isinstance(extra, dict):
@@ -36,7 +37,7 @@ def configure(home: Path):
     model = cfg.get("model", {})
     if isinstance(model, dict) and "workbuddy" in str(model.get("provider", "")).lower():
         current = str(model.get("default", ""))
-        region = "cn" if "-cn" in current else "ai"
+        region = "auto" if "-auto" in current else "cn" if "-cn" in current else "ai"
         model["default"] = f"deepseek-v4.1-flash-{region}"
         model["api_mode"] = "chat_completions"
     path.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -56,7 +57,7 @@ def configure(home: Path):
                  if "127.0.0.1:8787" not in key and "localhost:8787" not in key
                  and "workbuddy" not in key.lower()}
         cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-    print(f"{home}: 已固定两个 4.1 入口并启用会话标识，移除思考强度覆盖与旧目录缓存")
+    print(f"{home}: 已配置中国版、国际版、双区轮询三个 4.1 入口")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -1,4 +1,4 @@
-param([string]$Version='1.0.0',[string]$NativeTarget='')
+param([string]$Version='1.0.1',[string]$NativeTarget='')
 $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $PSScriptRoot
 $dist=Join-Path $root 'dist'
@@ -8,13 +8,13 @@ if($LASTEXITCODE -ne 0){throw '.NET publish failed'}
 $package=Join-Path $root ('artifacts\BuddyHub-v'+$Version+'-windows-x64')
 if(Test-Path -LiteralPath $package){throw 'Package directory already exists; use a fresh artifacts directory'}
 New-Item -ItemType Directory -Path (Join-Path $package 'tools') -Force | Out-Null
-foreach($name in 'BuddyHub.exe','buddyhub-service.exe'){
+foreach($name in 'BuddyHub.exe','buddyhub-service.exe','buddyhub-share.exe'){
     Copy-Item -LiteralPath (Join-Path $dist $name) -Destination $package
 }
-foreach($name in 'install.ps1','uninstall.ps1'){
+foreach($name in 'install.ps1','uninstall.ps1','install-sharing-tasks.ps1','configure-hermes.py'){
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $package 'tools')
 }
-foreach($name in 'README.md','LICENSE','THIRD_PARTY_NOTICES.md','setup.cmd'){
+foreach($name in 'README.md','SHARING.md','LICENSE','THIRD_PARTY_NOTICES.md','setup.cmd'){
     Copy-Item -LiteralPath (Join-Path $root $name) -Destination $package
 }
 $sourceCommit='unknown'
